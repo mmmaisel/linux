@@ -66,6 +66,10 @@ static LIST_HEAD(steam_devices);
 #define STEAM_DECK_TRIGGER_RESOLUTION 5461
 /* Joystick runs are about 5 mm and 32768 units */
 #define STEAM_DECK_JOYSTICK_RESOLUTION 6553
+/* Accelerometer has 16 bit resolution and a range of +/- 2g */
+#define STEAM_DECK_ACCEL_RES_PER_G 16384
+/* Gyroscope has 16 bit resolution and a range of +/- 2000 dps */
+#define STEAM_DECK_GYRO_RES_PER_DPS 16
 
 #define STEAM_PAD_FUZZ 256
 
@@ -126,6 +130,7 @@ struct steam_device {
 	struct mutex mutex;
 	bool client_opened;
 	struct input_dev __rcu *input;
+	struct input_dev __rcu *sensors;
 	unsigned long quirks;
 	struct work_struct work_connect;
 	bool connected;
@@ -604,6 +609,69 @@ input_register_fail:
 	return ret;
 }
 
+static int steam_sensors_register(struct steam_device *steam)
+{
+	struct hid_device *hdev = steam->hdev;
+	struct input_dev *sensors;
+	int ret;
+
+	rcu_read_lock();
+	sensors = rcu_dereference(steam->sensors);
+	rcu_read_unlock();
+	if (sensors) {
+		dbg_hid("%s: already connected\n", __func__);
+		return 0;
+	}
+
+	sensors = input_allocate_device();
+	if (!sensors)
+		return -ENOMEM;
+
+	input_set_drvdata(sensors, steam);
+	sensors->dev.parent = &hdev->dev;
+
+	sensors->name = (steam->quirks & STEAM_QUIRK_WIRELESS) ? "Wireless Steam Controller Sensors" :
+		(steam->quirks & STEAM_QUIRK_DECK) ? "Steam Deck Sensors" :
+		"Steam Controller Sensors";
+	sensors->phys = hdev->phys;
+	sensors->uniq = steam->serial_no;
+	sensors->id.bustype = hdev->bus;
+	sensors->id.vendor = hdev->vendor;
+	sensors->id.product = hdev->product;
+	sensors->id.version = hdev->version;
+
+	__set_bit(INPUT_PROP_ACCELEROMETER, sensors->propbit);
+	__set_bit(EV_MSC, sensors->evbit);
+	__set_bit(MSC_TIMESTAMP, sensors->mscbit);
+
+	/* Accelerometer */
+	input_set_abs_params(sensors, ABS_X, -32767, 32767, 16, 0);
+	input_set_abs_params(sensors, ABS_Y, -32767, 32767, 16, 0);
+	input_set_abs_params(sensors, ABS_Z, -32767, 32767, 16, 0);
+	input_abs_set_res(sensors, ABS_X, STEAM_DECK_ACCEL_RES_PER_G);
+	input_abs_set_res(sensors, ABS_Y, STEAM_DECK_ACCEL_RES_PER_G);
+	input_abs_set_res(sensors, ABS_Z, STEAM_DECK_ACCEL_RES_PER_G);
+
+	/* Gyroscope */
+	input_set_abs_params(sensors, ABS_RX, -32767, 32767, 16, 0);
+	input_set_abs_params(sensors, ABS_RY, -32767, 32767, 16, 0);
+	input_set_abs_params(sensors, ABS_RZ, -32767, 32767, 16, 0);
+	input_abs_set_res(sensors, ABS_RX, STEAM_DECK_GYRO_RES_PER_DPS);
+	input_abs_set_res(sensors, ABS_RY, STEAM_DECK_GYRO_RES_PER_DPS);
+	input_abs_set_res(sensors, ABS_RZ, STEAM_DECK_GYRO_RES_PER_DPS);
+
+	ret = input_register_device(sensors);
+	if (ret)
+		goto input_register_fail;
+
+	rcu_assign_pointer(steam->sensors, sensors);
+	return 0;
+
+input_register_fail:
+	input_free_device(sensors);
+	return ret;
+}
+
 static void steam_input_unregister(struct steam_device *steam)
 {
 	struct input_dev *input;
@@ -615,6 +683,19 @@ static void steam_input_unregister(struct steam_device *steam)
 	RCU_INIT_POINTER(steam->input, NULL);
 	synchronize_rcu();
 	input_unregister_device(input);
+}
+
+static void steam_sensors_unregister(struct steam_device *steam)
+{
+	struct input_dev *sensors;
+	rcu_read_lock();
+	sensors = rcu_dereference(steam->sensors);
+	rcu_read_unlock();
+	if (!sensors)
+		return;
+	RCU_INIT_POINTER(steam->sensors, NULL);
+	synchronize_rcu();
+	input_unregister_device(sensors);
 }
 
 static void steam_battery_unregister(struct steam_device *steam)
@@ -673,10 +754,14 @@ static int steam_register(struct steam_device *steam)
 		steam_set_lizard_mode(steam, lizard_mode);
 	mutex_unlock(&steam->mutex);
 
-	if (!client_opened)
+	if (!client_opened) {
 		ret = steam_input_register(steam);
-	else
+		if (ret != 0)
+			return ret;
+		ret = steam_sensors_register(steam);
+	} else {
 		ret = 0;
+	}
 
 	return ret;
 }
@@ -685,6 +770,7 @@ static void steam_unregister(struct steam_device *steam)
 {
 	steam_battery_unregister(steam);
 	steam_input_unregister(steam);
+	steam_sensors_unregister(steam);
 	if (steam->serial_no[0]) {
 		hid_info(steam->hdev, "Steam Controller '%s' disconnected",
 				steam->serial_no);
@@ -780,6 +866,7 @@ static int steam_client_ll_open(struct hid_device *hdev)
 	mutex_unlock(&steam->mutex);
 
 	steam_input_unregister(steam);
+	steam_sensors_unregister(steam);
 
 	return 0;
 }
@@ -801,8 +888,10 @@ static void steam_client_ll_close(struct hid_device *hdev)
 		steam_set_lizard_mode(steam, lizard_mode);
 	mutex_unlock(&steam->mutex);
 
-	if (connected)
+	if (connected) {
 		steam_input_register(steam);
+		steam_sensors_register(steam);
+	}
 }
 
 static int steam_client_ll_raw_request(struct hid_device *hdev,
@@ -1309,6 +1398,19 @@ static void steam_do_deck_input_event(struct steam_device *steam,
 	input_sync(input);
 }
 
+static void steam_do_deck_sensors_event(struct steam_device *steam,
+		struct input_dev *sensors, u8 *data)
+{
+	input_report_abs(sensors, ABS_X, steam_le16(data + 24));
+	input_report_abs(sensors, ABS_Z, steam_le16(data + 26));
+	input_report_abs(sensors, ABS_Y, steam_le16(data + 28));
+	input_report_abs(sensors, ABS_RX, steam_le16(data + 30));
+	input_report_abs(sensors, ABS_RZ, steam_le16(data + 32));
+	input_report_abs(sensors, ABS_RY, steam_le16(data + 34));
+
+	input_sync(sensors);
+}
+
 /*
  * The size for this message payload is 11.
  * The known values are:
@@ -1346,6 +1448,7 @@ static int steam_raw_event(struct hid_device *hdev,
 {
 	struct steam_device *steam = hid_get_drvdata(hdev);
 	struct input_dev *input;
+	struct input_dev *sensors;
 	struct power_supply *battery;
 
 	if (!steam)
@@ -1391,6 +1494,9 @@ static int steam_raw_event(struct hid_device *hdev,
 		input = rcu_dereference(steam->input);
 		if (likely(input))
 			steam_do_deck_input_event(steam, input, data);
+		sensors = rcu_dereference(steam->sensors);
+		if (likely(sensors))
+			steam_do_deck_sensors_event(steam, sensors, data);
 		rcu_read_unlock();
 		break;
 	case STEAM_EV_CONNECT:
