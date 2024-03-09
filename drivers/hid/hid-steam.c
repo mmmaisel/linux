@@ -291,6 +291,7 @@ struct steam_device {
 	struct hid_device *hdev, *client_hdev;
 	struct mutex report_mutex;
 	unsigned long client_opened;
+	bool ll_hide_input;
 	struct input_dev __rcu *input;
 	struct input_dev __rcu *sensors;
 	unsigned long quirks;
@@ -717,6 +718,8 @@ static int steam_input_register(struct steam_device *steam)
 	if (!input)
 		return -ENOMEM;
 
+	dev_err(&steam->hdev->dev, "steam input: %p\n", input);
+
 	input_set_drvdata(input, steam);
 	input->dev.parent = &hdev->dev;
 	input->open = steam_input_open;
@@ -851,6 +854,8 @@ static int steam_sensors_register(struct steam_device *steam)
 	if (!sensors)
 		return -ENOMEM;
 
+	dev_err(&steam->hdev->dev, "steam sensors: %p\n", sensors);
+
 	input_set_drvdata(sensors, steam);
 	sensors->dev.parent = &hdev->dev;
 
@@ -890,6 +895,7 @@ static int steam_sensors_register(struct steam_device *steam)
 	return 0;
 
 input_register_fail:
+	dev_err(&steam->hdev->dev, "input reg fail: %p\n", sensors);
 	input_free_device(sensors);
 	return ret;
 }
@@ -904,6 +910,7 @@ static void steam_input_unregister(struct steam_device *steam)
 		return;
 	RCU_INIT_POINTER(steam->input, NULL);
 	synchronize_rcu();
+	dev_err(&steam->hdev->dev, "steam unreg input: %p\n", input);
 	input_unregister_device(input);
 }
 
@@ -921,6 +928,7 @@ static void steam_sensors_unregister(struct steam_device *steam)
 		return;
 	RCU_INIT_POINTER(steam->sensors, NULL);
 	synchronize_rcu();
+	dev_err(&steam->hdev->dev, "steam unreg sensors: %p\n", sensors);
 	input_unregister_device(sensors);
 }
 
@@ -1101,13 +1109,17 @@ static int steam_client_ll_open(struct hid_device *hdev)
 {
 	struct steam_device *steam = hdev->driver_data;
 	unsigned long flags;
+	bool ll_hide_input;
 
 	spin_lock_irqsave(&steam->lock, flags);
 	steam->client_opened++;
+	ll_hide_input = steam->ll_hide_input;
 	spin_unlock_irqrestore(&steam->lock, flags);
 
-	steam_input_unregister(steam);
-	steam_sensors_unregister(steam);
+	if (ll_hide_input) {
+		steam_input_unregister(steam);
+		steam_sensors_unregister(steam);
+	}
 
 	return 0;
 }
@@ -1118,16 +1130,20 @@ static void steam_client_ll_close(struct hid_device *hdev)
 
 	unsigned long flags;
 	bool connected;
+	bool ll_hide_input;
 
 	spin_lock_irqsave(&steam->lock, flags);
 	steam->client_opened--;
 	connected = steam->connected && !steam->client_opened;
+	ll_hide_input = steam->ll_hide_input;
 	spin_unlock_irqrestore(&steam->lock, flags);
 
 	if (connected) {
 		steam_set_lizard_mode(steam, lizard_mode);
-		steam_input_register(steam);
-		steam_sensors_register(steam);
+		if (ll_hide_input) {
+			steam_input_register(steam);
+			steam_sensors_register(steam);
+		}
 	}
 }
 
@@ -1180,6 +1196,77 @@ static struct hid_device *steam_create_client_hid(struct hid_device *hdev)
 	return client_hdev;
 }
 
+static ssize_t steam_ll_hide_input_show(struct device *dev,
+		struct device_attribute *attr, char* buf)
+{
+	// XXX: has to access hidraw device if called over input/event device
+	struct hid_device *hdev = to_hid_device(dev);
+	// this callback is for the ll device, so use driver_data directly
+	struct steam_device *steam = hdev->driver_data;
+	dev_err(dev, "steam_ll_show steamraw: %p, %p\n", dev, steam);
+
+	unsigned long flags;
+	bool ll_hide_input = false;
+
+	if (steam != 0) {
+		spin_lock_irqsave(&steam->lock, flags);
+		ll_hide_input = steam->ll_hide_input;
+		spin_unlock_irqrestore(&steam->lock, flags);
+	}
+
+	if (ll_hide_input) {
+		return sysfs_emit(buf, "1\n");
+	}
+
+	return sysfs_emit(buf, "0\n");
+}
+
+static ssize_t steam_ll_hide_input_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	// XXX: has to access hidraw device if called over input/event device
+	struct hid_device *hdev = to_hid_device(dev);
+	struct steam_device *steam = hdev->driver_data;
+
+	// XXX: protect against re-entrancy
+	// XXX: protect concurrent register/unregister calls (RCU not enough)
+
+	bool connected;
+	unsigned long flags;
+	unsigned long client_opened;
+	dev_err(dev, "steam_ll_store steamraw: %p, %p, %d\n", dev, steam, buf[0]);
+
+	if (! ((count == 2 && buf[1] == '\n') || count == 1) ) {
+		return -EINVAL;
+	}
+
+	spin_lock_irqsave(&steam->lock, flags);
+	client_opened = steam->client_opened;
+	connected = steam->connected && !steam->client_opened;
+
+	if (buf[0] == '0') {
+		steam->ll_hide_input = false;
+	} else {
+		steam->ll_hide_input = true;
+	}
+	spin_unlock_irqrestore(&steam->lock, flags);
+
+	if (client_opened != 0) {
+		if (buf[0] == '0') {
+			steam_input_register(steam);
+			steam_sensors_register(steam);
+		} else {
+			steam_input_unregister(steam);
+			steam_sensors_unregister(steam);
+		}
+	}
+
+	return count;
+}
+
+static DEVICE_ATTR(ll_hide_input, 0664,
+	steam_ll_hide_input_show, steam_ll_hide_input_store);
+
 static int steam_probe(struct hid_device *hdev,
 				const struct hid_device_id *id)
 {
@@ -1215,6 +1302,7 @@ static int steam_probe(struct hid_device *hdev,
 	spin_lock_init(&steam->lock);
 	mutex_init(&steam->report_mutex);
 	steam->quirks = id->driver_data;
+	steam->ll_hide_input = true;
 	INIT_WORK(&steam->work_connect, steam_work_connect_cb);
 	INIT_DELAYED_WORK(&steam->mode_switch, steam_mode_switch_cb);
 	INIT_LIST_HEAD(&steam->list);
@@ -1258,11 +1346,34 @@ static int steam_probe(struct hid_device *hdev,
 		ret = PTR_ERR(steam->client_hdev);
 		goto err_stream_unregister;
 	}
+	// XXX: this crashes module
+	//steam->hdev->driver_data = steam;
+	//hid_set_drvdata(steam->client_hdev->driver_data, steam);
 	steam->client_hdev->driver_data = steam;
 
+    // XXX: use hid_err for important fails
+    /*dev_err(&hdev->dev, "steam: %p\n", steam);
+    dev_err(&hdev->dev, "steam-client_hdev: %p\n", steam->client_hdev);
+    dev_err(&hdev->dev, "steam-client_dev: %p\n", &steam->client_hdev->dev);
+    dev_err(&hdev->dev, "steam-client_hdev drv: %p\n", steam->client_hdev->driver_data);
+    dev_err(&hdev->dev, "steam-hdev_dev_parent: %p\n", steam->client_hdev->dev.parent);
+    dev_err(&hdev->dev, "steam-hdev: %p\n", steam->hdev);
+    dev_err(&hdev->dev, "steam-hdev_dev: %p\n", &steam->hdev->dev);
+    dev_err(&hdev->dev, "steam-hdev drv: %p\n", steam->hdev->driver_data);
+    dev_err(&hdev->dev, "steam-hdev_dev_parent: %p\n", steam->hdev->dev.parent);
+    dev_err(&hdev->dev, "steam-hdev_dev_parent_name: %s\n", steam->hdev->dev.parent->init_name);*/
+
+	dev_set_uevent_suppress(&steam->client_hdev->dev, 1);
 	ret = hid_add_device(steam->client_hdev);
 	if (ret)
 		goto err_destroy;
+
+	// Create it manually so it only affects the single hidraw device.
+	ret = device_create_file(&steam->client_hdev->dev, &dev_attr_ll_hide_input);
+	if (ret)
+		goto err_destroy;
+	dev_set_uevent_suppress(&steam->client_hdev->dev, 0);
+	kobject_uevent(&steam->client_hdev->dev.kobj, KOBJ_ADD);
 
 	return 0;
 
@@ -1292,6 +1403,7 @@ static void steam_remove(struct hid_device *hdev)
 		return;
 	}
 
+	device_remove_file(&steam->client_hdev->dev, &dev_attr_ll_hide_input);
 	cancel_delayed_work_sync(&steam->mode_switch);
 	cancel_work_sync(&steam->work_connect);
 	hid_destroy_device(steam->client_hdev);
@@ -1725,7 +1837,7 @@ static int steam_raw_event(struct hid_device *hdev,
 
 	switch (data[2]) {
 	case ID_CONTROLLER_STATE:
-		if (steam->client_opened)
+		if (steam->client_opened && steam->ll_hide_input)
 			return 0;
 		rcu_read_lock();
 		input = rcu_dereference(steam->input);
@@ -1734,7 +1846,7 @@ static int steam_raw_event(struct hid_device *hdev,
 		rcu_read_unlock();
 		break;
 	case ID_CONTROLLER_DECK_STATE:
-		if (steam->client_opened)
+		if (steam->client_opened && steam->ll_hide_input)
 			return 0;
 		rcu_read_lock();
 		input = rcu_dereference(steam->input);
